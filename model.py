@@ -15,8 +15,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# CHANGED: Added to extract the words on mismatched positions
+
+#CHANGED
 import tiktoken
+import csv
 
 
 class LayerNorm(nn.Module):
@@ -409,6 +411,7 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        probabilities = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -420,6 +423,9 @@ class GPT(nn.Module):
             if top_k is not None:
                 if top_k == 1:
                     idx = torch.cat((idx, torch.argmax(logits, dim=-1).reshape((-1,1))), dim=1) # using argmax here preserves RNG state
+                    # CHANGED: Added to extract the normalized logits in the draft model during speculative decoding
+                    probs = F.softmax(logits, dim=-1) # torch.Size([1, 50257])
+                    probabilities.append(probs[0])
                     continue
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
@@ -433,7 +439,7 @@ class GPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx
+        return idx, probabilities
         
     @torch.no_grad()
     def generate_kv(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -501,7 +507,7 @@ class GPT(nn.Module):
         return torch.cat((idx, new_tokens), dim=1)
     
     @torch.no_grad()
-    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, sample_idx=0):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -520,6 +526,18 @@ class GPT(nn.Module):
         
         enc = tiktoken.get_encoding("gpt2")
         decode2word = lambda l: enc.decode(l)
+        
+
+        file_name = 'profile_'+str(sample_idx)+'.csv'
+        with open(file_name, 'w', newline='') as file:
+            writer = csv.writer(file)
+            field = ["main_idx", "main_word", \
+                    "top_2", "top_2_word","top_3", "top_3_word","top_4", "top_4_word","top_5","top_5_word",\
+                    "draft_idx", "draft_word", \
+                    "top_2", "top_2_word","top_3", "top_3_word","top_4", "top_4_word","top_5", "top_5_word",]
+            writer.writerow(field)
+
+
 
         while idx.size(1) < idx_length_original+max_new_tokens:
             loop_counter += 1
@@ -531,7 +549,7 @@ class GPT(nn.Module):
             ### YOUR CODE HERE
             # use the draft_model to generate speculative tokens
             # idx_cond = [1,192]
-            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k = 1)
+            idx_speculative, draft_probs = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k = 1)
             # torch.Size([1, 196])
             # obtain the logits from the main model by passing in the idx_speculative
             all_logits, _= self(idx_speculative) # TODO torch.Size([1, 196, 50257])
@@ -565,16 +583,37 @@ class GPT(nn.Module):
                     break
 
                 if idx_next != idx_speculative[:,idx_cond.size(1)+k]:
-                    # print("Prob:")
-                    # print(probs) # Probability of the main model
-                    print("idx_next:")
-                    print(idx_next) # Tensor([[elem]])
-                    print(decode2word(idx_next.cpu().numpy()[-1]))
-                    # tok_emb = self.transformer.wte(idx_next) # Code to extract the embedding vector
+                    row = []
+                    prob_list = torch.topk(probs[0], 5).values.tolist()
+                    index_list = torch.topk(probs[0], 5).indices.tolist()
+
+                    main_idx = idx_next.cpu().numpy()[-1][-1]
+                    main_word= decode2word([main_idx])
+                    row.append(str(main_idx))
+                    row.append(main_word)
+
+                    for i in range(1, 5):
+                        row.append(str(prob_list[i])) # top_k_prob
+                        row.append(decode2word([index_list[i]])) # top_k_word
                     
-                    print("spec") # Tensor([elem])
-                    print(idx_speculative[:,idx_cond.size(1)+k])
-                    print(decode2word(idx_speculative[:,idx_cond.size(1)+k].cpu().numpy()))
+                    draft_idx = idx_speculative[:,idx_cond.size(1)+k].cpu().numpy()[-1]
+                    draft_word = decode2word([draft_idx])
+                    row.append(str(draft_idx))
+                    row.append(draft_word)
+
+                    draft_prob_list = torch.topk(draft_probs[k], 5).values.tolist()
+                    draft_index_list = torch.topk(draft_probs[k], 5).indices.tolist()
+
+                    # Make sure if we are extracting the proper probabilities
+                    assert draft_idx == draft_index_list[0]
+                    
+                    for i in range(1, 5):
+                        row.append(str(draft_prob_list[i])) # top_k_prob
+                        row.append(decode2word([draft_index_list[i]])) # top_k_word
+
+                    with open(file_name, 'a', newline='') as file:
+                        writer = csv.writer(file)
+                        writer.writerow(row)
                     break
             ### END YOUR CODE HERE
         print(f"speculative decoding ran for {loop_counter} iterations")

@@ -12,13 +12,13 @@ import numpy as np
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = '../proejct/model_weights' # ignored if init_from is not 'resume'
+out_dir = '../project/model_weights' # ignored if init_from is not 'resume'
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 3 # number of samples to draw
 num_warmup = 1 # how many warmups to do before benchmarking
 max_new_tokens = 128 # number of tokens generated in each sample
 temperature = 0.4 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-speculative_tokens = 3 # how many tokens should the draft model decode?
+speculative_tokens = 4 # how many tokens should the draft model decode?
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
 batch_size = 32
@@ -31,7 +31,7 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 #CHANGED: Added some configuration parameters
 #How to define block size? -> for now defined it so that idx tensor shape matches what we saw in assignment 2
 block_size = 192
-data_dir = "../proejct/shakespear"
+data_dir = "../project/shakespear"
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 load_from_val = True
 
@@ -158,7 +158,7 @@ with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             torch.manual_seed(k+1337) # we want consistency
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y, _= model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             generations_naive.append(y[0].tolist())
             print(decode(generations_naive[-1]))
             print('---------------')
@@ -207,7 +207,7 @@ if x.size(0) == 1:
         with ctx:
             for k in range(num_samples):
                 torch.manual_seed(k+1337) # we want consistency
-                y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k)
+                y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k, sample_idx = k)
                 generations_spec.append(y[0].tolist())
                 print(decode(generations_spec[-1]))
                 print('---------------')
