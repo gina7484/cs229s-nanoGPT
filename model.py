@@ -6,7 +6,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
-
+DEBUG = False
 import math
 import inspect
 from dataclasses import dataclass
@@ -14,6 +14,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# CHANGED: Added to extract the words on mismatched positions
+import tiktoken
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -48,6 +52,14 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        
+        ### Initialize KV cache with up to a maximum sequence length. Also, keep track of how much of it is filled in self.seq_pos.
+        batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
+        seq_dim = 512 # the maximum sequence length we'll support
+        self.seq_pos = 0 # disabled by default
+        self.kv_enabled = False # disabled by default
+        so  = (2, batch_dim,self.n_head,seq_dim,self.n_embd//self.n_head)
+        self.register_buffer("kv_cache", torch.empty((2,batch_dim,self.n_head,seq_dim,self.n_embd//self.n_head), dtype=torch.float32), persistent=False)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -57,6 +69,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        ### Set KV cache if it exists:
+        if self.kv_enabled:
+            ### YOUR CODE HERE
+            
+            # set the new seq_pos
+            self.seq_pos =  T
+            # update the kv cache
+            (self.get_buffer("kv_cache"))[0,:B,:,:self.seq_pos,:] = k[None,:,:,:,:]
+            (self.get_buffer("kv_cache"))[1,:B,:,:self.seq_pos,:] = v[None,:,:,:,:]
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -73,6 +95,45 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        return y
+    
+    def decode(self, x): # note: x now only includes the tokns *after* the KV cache
+        if not self.kv_enabled:
+            raise ValueError("KV cache is not enabled!")
+        
+        B, T, C = x.size()
+
+        # Use both the KV cache and the input to run MHA! Make sure to save new KV projections into the cache, too!
+        ### YOUR CODE HERE
+
+        # compute q, k, v projections of x
+        #x only includes tokens after KV cache
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        
+        # update the kv cache with the additional input
+        self.get_buffer("kv_cache")[0,:B,:,self.seq_pos:self.seq_pos+1,:] = k[None,:,:,:,:]
+        self.get_buffer("kv_cache")[1,:B,:,self.seq_pos:self.seq_pos+1,:] = v[None,:,:,:,:]        
+
+        my_buff = self.get_buffer("kv_cache")
+        
+        # compute manual implmentation of attention using the kv cache
+        if self.flash:
+          y = torch.nn.functional.scaled_dot_product_attention(q, my_buff[0,:B,:,:self.seq_pos+1,:], my_buff[1,:B,:,:self.seq_pos+1,:], attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
+        else:
+          att = (q @ my_buff[0,:B,:,:self.seq_pos+1,:].transpose(-2, -1)) * (1.0 / math.sqrt(my_buff[0,:B,:,:self.seq_pos+1,:].size(-1)))
+          att = F.softmax(att, dim=-1)
+          att = self.attn_dropout(att)
+          y = att @ my_buff[1,:B,:,:self.seq_pos+1,:] # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # compute output projection
+        y = self.resid_dropout(self.c_proj(y))
+        
+        # update the position
+        self.seq_pos = self.seq_pos + 1
+
         return y
 
 class MLP(nn.Module):
@@ -102,6 +163,11 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+    def decode(self, x):
+        x = x + self.attn.decode(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -147,6 +213,20 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    # Some scaffolding from the 229s teaching staff.
+    @property # this is just a convenience function to make accessing easier
+    def seq_pos(self):
+        return self.transformer.h[0].attn.seq_pos
+    @seq_pos.setter
+    def seq_pos(self, value):
+        for block in self.transformer.h:
+            block.attn.seq_pos = value
+    def enable_kv(self, use_kv=True):
+        self.seq_pos = 0 if use_kv else None
+        self.kv_enabled = use_kv
+        for block in self.transformer.h:
+            block.attn.kv_enabled = use_kv
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -172,7 +252,6 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -180,17 +259,38 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            #CHANGED: nanoGPT returns only [-1] logit, updated it to match assignment2 code
+            logits = self.lm_head(x) # note: using list [-1] to preserve the time dim
             loss = None
-
         return logits, loss
+    
+    def decode(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert self.seq_pos + t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        
+        # Run decoding on the GPT model itself. Make sure you set the right position embeddings!
+        pos = torch.arange(self.seq_pos, t+self.seq_pos, dtype=torch.long, device=device) 
+        ### YOUR CODE HERE
+        # create token and position embeddings
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        # perform decoding
+        for block in self.transformer.h:
+            x = block.decode(x)
+        # apply transformer layer normalization
+        x = self.transformer.ln_f(x)
+        # apply the language model head
+        logits = self.lm_head(x)
+        # return the output
+        return logits
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -301,7 +401,7 @@ class GPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
-
+    
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -318,13 +418,164 @@ class GPT(nn.Module):
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
+                if top_k == 1:
+                    idx = torch.cat((idx, torch.argmax(logits, dim=-1).reshape((-1,1))), dim=1) # using argmax here preserves RNG state
+                    continue
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+
+            # sample from the distribution with temperature
             idx_next = torch.multinomial(probs, num_samples=1)
+
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+        
+    @torch.no_grad()
+    def generate_kv(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+
+        # Generate the full KV cache and decode the first token
+        new_tokens = torch.empty((idx.size(0), 0))
+
+        ### YOUR CODE HERE
+        # run the idx through the forward pass to get the logits
+        logits,_ = self(idx)
+
+        # pluck the logits at the final position and scale by desired temperature
+        logits = logits[:, -1, :] / temperature
+
+        # optionally crop the logits to only the top k options
+        if top_k is not None:
+          if top_k == 1:
+              # TODO idx_next = ...
+              idx_next = torch.argmax(logits, dim=-1).reshape((-1,1)) 
+
+          else:
+              # TODO idx_next = ...
+              v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+              logits[logits < v[:, [-1]]] = -float('Inf')
+              probs = F.softmax(logits, dim=-1)
+              idx_next = torch.multinomial(probs, num_samples=1) 
+        else:
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1) 
+        
+        # save the new tokens
+        new_tokens = idx_next
+        ### END YOUR CODE HERE
+
+        for _ in range(max_new_tokens-1):
+            # Now decode using the KV cache
+            ### YOUR CODE HERE
+            # decode from the new tokens to get the logits
+            logits = self.decode(idx_next)
+            # pluck the logits at the final position and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+              if top_k == 1:
+                  # TODO idx_next = ...
+                  idx_next = torch.argmax(logits, dim=-1).reshape((-1,1)) 
+              else:
+                 # TODO idx_next = ...
+                  v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                  logits[logits < v[:, [-1]]] = -float('Inf')
+                  probs = F.softmax(logits, dim=-1)
+                  idx_next = torch.multinomial(probs, num_samples=1) 
+            else:
+              probs = F.softmax(logits, dim=-1)
+              idx_next = torch.multinomial(probs, num_samples=1) 
+            # store the new tokens
+            new_tokens = torch.cat((new_tokens,idx_next), dim=1)
+            ### END YOUR CODE HERE
+
+        return torch.cat((idx, new_tokens), dim=1)
+    
+    @torch.no_grad()
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+
+        self.enable_kv(False) # disable KV cache for the main model -- it's not worth the effort
+
+        # note: making speculative decoding work with batch_size>1 is beyond this assignment's scope, because the
+        # tensors rapidly become ragged. So, you can assume that batch_size=1 for this part.
+        if idx.size(0) != 1:
+            raise ValueError("speculative decoding only works with batch size 1")
+        idx_length_original = idx.size(1)
+        
+        loop_counter = 0
+        
+        enc = tiktoken.get_encoding("gpt2")
+        decode2word = lambda l: enc.decode(l)
+
+        while idx.size(1) < idx_length_original+max_new_tokens:
+            loop_counter += 1
+
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -self.config.block_size-num_speculative:]
+            # Generate speculative tokens from the draft model. Then, run it through the main model.
+            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+            ### YOUR CODE HERE
+            # use the draft_model to generate speculative tokens
+            # idx_cond = [1,192]
+            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k = 1)
+            # torch.Size([1, 196])
+            # obtain the logits from the main model by passing in the idx_speculative
+            all_logits, _= self(idx_speculative) # TODO torch.Size([1, 196, 50257])
+            ### END YOUR CODE HERE
+            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+            ### YOUR CODE HERE
+
+            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+            for k in range(num_speculative+1):
+                # pluck the logits at the current position and scale by desired temperature
+                logits = all_logits[:,idx_cond.size(1)+k-1,:] / temperature
+                
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                  if top_k == 1:
+                    # TODO idx_next = ...
+                    idx_next = torch.argmax(logits, dim=-1).reshape((-1,1)) 
+                  else:
+                    # TODO idx_next = ...
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1) 
+                else:
+                  probs = F.softmax(logits, dim=-1)
+                  idx_next = torch.multinomial(probs, num_samples=1) 
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx,idx_next),dim=1)
+                # end the loop if the next token does not match the next token in idx_speculative
+                if k==num_speculative:
+                    break
+
+                if idx_next != idx_speculative[:,idx_cond.size(1)+k]:
+                    # print("Prob:")
+                    # print(probs) # Probability of the main model
+                    print("idx_next:")
+                    print(idx_next) # Tensor([[elem]])
+                    print(decode2word(idx_next.cpu().numpy()[-1]))
+                    # tok_emb = self.transformer.wte(idx_next) # Code to extract the embedding vector
+                    
+                    print("spec") # Tensor([elem])
+                    print(idx_speculative[:,idx_cond.size(1)+k])
+                    print(decode2word(idx_speculative[:,idx_cond.size(1)+k].cpu().numpy()))
+                    break
+            ### END YOUR CODE HERE
+        print(f"speculative decoding ran for {loop_counter} iterations")
+        return idx[:,:idx_length_original+max_new_tokens]
